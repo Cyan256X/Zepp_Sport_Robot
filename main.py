@@ -8,6 +8,7 @@ import struct
 import time
 import os
 import urllib.parse
+import hashlib
 
 def login(account, password):
     PHONE_PATTERN = r"(^(1)\d{10}$)"
@@ -160,6 +161,47 @@ def URL_encode_dataJSON(dateToday, deviceID, steps):
     return Encoded_dataJSON
 
 
+def get_progressive_steps():
+    """渐进增长模式:按当前北京时间计算应提交的步数(单调递增)。
+
+    时间窗口:北京时间 07:00 - 08:00
+    - 07:00 提交 ProgressiveStartSteps(起始小值)
+    - 08:00 及之后提交当日目标步数
+    - 中间按时间线性插值,并叠加不超过档距 1/3 的随机抖动,保证单调递增且数值自然
+
+    当日目标步数以北京日期为随机种子生成,保证同一天内多次触发(每10分钟一档)结果一致,
+    避免后一档小于前一档(Zepp 平台步数只能增大,不能减小)。
+    """
+    BEIJING_OFFSET = 8 * 3600
+    WINDOW_START = 7 * 60    # 07:00
+    WINDOW_END = 8 * 60      # 08:00
+    INTERVALS = 6            # 07:00 到 08:00 共 6 个 10 分钟间隔(7 个触发点)
+
+    saved_state = random.getstate()   # 保存随机状态,避免污染主流程
+    try:
+        now_bj = time.localtime(time.time() + BEIJING_OFFSET)
+        minutes = now_bj.tm_hour * 60 + now_bj.tm_min
+
+        # 当日目标:按北京日期播种,全天各次触发结果一致
+        day = time.strftime('%Y-%m-%d', now_bj)
+        random.seed(int(hashlib.md5(day.encode('utf-8')).hexdigest(), 16) % (2**32))
+        target = random.randint(DefaultRandomMin, DefaultRandomMax)
+
+        if minutes < WINDOW_START:
+            return ProgressiveStartSteps
+        elif minutes >= WINDOW_END:
+            return target
+        else:
+            progress = (minutes - WINDOW_START) / (WINDOW_END - WINDOW_START)
+            steps = int(ProgressiveStartSteps + (target - ProgressiveStartSteps) * progress)
+            # 微小随机抖动(幅度 < 档距的1/3,保证仍单调递增)
+            span = (target - ProgressiveStartSteps) / float(INTERVALS)
+            steps += random.randint(0, max(1, int(span * 0.3)))
+            return steps
+    finally:
+        random.setstate(saved_state)
+
+
 # 主程序
 if __name__ == "__main__":
     # 从环境变量安全地获取 GitHub Secret 中的账号与密码
@@ -182,14 +224,23 @@ if __name__ == "__main__":
     # 默认随机范围（用于步数设置为None的情况）
     DefaultRandomMin = 35000
     DefaultRandomMax = 65000
+
+    # ===== 渐进增长模式 =====
+    # True: 北京时间 07:00-08:00 步数随时间逐渐增长(需配合 workflow 中 7:00-8:00 的定时触发)
+    # False: 恢复为原来的单次随机/固定步数模式
+    ProgressiveMode = True
+    ProgressiveStartSteps = 1000   # 07:00 时的起始步数(当天第一次提交的值)
     
     for i in AccountGroup:   # 遍历用户账号组中的每个账号信息并对每个用户账号执行步数刷取操作
         account = i[0]
         password = i[1]
         step_config = i[2]
         
-        # 根据步数配置类型确定最终步数
-        if step_config is None:
+        # 渐进增长模式:北京时间 07:00-08:00 步数随时间逐渐增长(优先于其它步数配置)
+        if ProgressiveMode:
+            step = get_progressive_steps()
+            print(f"信息:账号:{account},本次步数类型:渐进增长模式(北京07:00-08:00),本次最终步数:{step}")
+        elif step_config is None:
             # 使用默认随机范围
             step = random.randint(DefaultRandomMin, DefaultRandomMax)
             print(f"信息:账号:{account},本次步数类型:默认范围随机,本次随机范围:[{DefaultRandomMin}-{DefaultRandomMax}],本次最终步数:{step}")
